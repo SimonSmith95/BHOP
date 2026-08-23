@@ -1,0 +1,10 @@
+# BHOP — Lab Optimizer dependencies
+# Install with:  pip install -r requirements.txt
+
+optuna>=3.6
+pyside6>=6.7
+pandas>=2.0
+numpy>=1.26
+matplotlib>=3.8
+sqlalchemy>=2.0
+scikit-learn>=1.4

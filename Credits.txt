@@ -1,0 +1,3 @@
+The software is validated on a benchmarking set found in a repo by:
+Liang, Q., Gongora, A.E., Ren, Z. et al. Benchmarking the performance of Bayesian optimization
+across multiple experimental materials science domains. npj Comput Mater 7, 188 (2021). https://doi.org/10.1038/s41524-021-00656-9
