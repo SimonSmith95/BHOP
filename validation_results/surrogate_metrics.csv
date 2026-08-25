@@ -1,5 +1,0 @@
-Split,Model,RMSE,MAE,Pearson_r,Spearman_rho
-70/30 hold-out,RandomForest,169726.4952,111930.982,0.8874,0.7468
-70/30 hold-out,GaussianProcess,186892.7373,131152.4355,0.8354,0.67
-Repeated 5-fold CV,RandomForest,161833.3944,115866.4685,0.8097,0.7016
-Repeated 5-fold CV,GaussianProcess,168281.9273,112851.3314,0.7996,0.723
