@@ -11,7 +11,7 @@ from typing import List, Optional
 import optuna
 from PySide6.QtCore import QThread, Signal
 
-from optuna_builder import ask_batch, tell_batch
+from optuna_builder import ask_batch, compute_full_params, tell_batch
 from parameter_config import StudyConfig
 from session_manager import SessionManager, SessionState
 
@@ -88,12 +88,20 @@ class OptimizationWorker(QThread):
 
                 # ── Ask ────────────────────────────────────────────────────
                 trials = ask_batch(self._study, self._config, batch_size)
-                SessionManager.mark_batch_pending(self._session_state, trials)
 
+                # compute_full_params applies all equality and inequality
+                # constraints so that BatchResultsDialog shows the exact
+                # feasible values the user should prepare in the lab.
+                # This must happen BEFORE mark_batch_pending so the session
+                # JSON stores the constraint-satisfying params, not the raw
+                # unconstrained Optuna suggestions.
                 param_dicts = [
-                    {"trial_number": t.number, "params": dict(t.params)}
+                    {"trial_number": t.number,
+                     "params": compute_full_params(t, self._config)}
                     for t in trials
                 ]
+
+                SessionManager.mark_batch_pending(self._session_state, param_dicts)
 
                 # Reset the handshake event and signal the GUI
                 self._results_ready.clear()
@@ -112,7 +120,19 @@ class OptimizationWorker(QThread):
                 # ── Tell ───────────────────────────────────────────────────
                 trial_numbers = [r["trial_number"] for r in self._pending_results]
                 values_list   = [r["values"]        for r in self._pending_results]
-                tell_batch(self._study, trial_numbers, values_list)
+
+                # Look up the constrained params for each trial from the pending
+                # batch (what was actually shown to / run by the user).  These
+                # are passed to tell_batch so Optuna's surrogate trains on the
+                # correct feasible values rather than the raw internal suggestions.
+                pending_by_num = {
+                    p["trial_number"]: p["params"]
+                    for p in (self._session_state.pending_batch or [])
+                }
+                constrained = [pending_by_num.get(n, {}) for n in trial_numbers]
+
+                tell_batch(self._study, trial_numbers, values_list,
+                           constrained, self._config)
                 SessionManager.clear_pending_batch(self._session_state)
 
                 self.batch_complete.emit(batch_idx + 1, n_batches)

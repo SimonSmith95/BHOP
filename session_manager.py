@@ -152,23 +152,26 @@ class SessionManager:
             return []
 
     @staticmethod
-    def mark_batch_pending(state: SessionState, trials) -> None:
+    def mark_batch_pending(state: SessionState, param_dicts: List[dict]) -> None:
         """
-        Record *trials* (list of optuna.Trial) as the currently pending batch,
-        export their suggested parameters to *pending_batch.csv* for lab use,
-        and save the session.
+        Record *param_dicts* as the currently pending batch, export their
+        suggested parameters to *pending_batch.csv* for lab use, and save
+        the session.
+
+        Parameters
+        ----------
+        param_dicts
+            List of ``{"trial_number": int, "params": dict}`` where *params*
+            are the **constraint-enforced** values that will actually be shown
+            to the user and run in the lab (not the raw Optuna internal params).
         """
-        pending = [
-            {"trial_number": t.number, "params": dict(t.params)}
-            for t in trials
-        ]
-        state.pending_batch = pending
+        state.pending_batch = param_dicts
         SessionManager.save(state)
 
         # Write lab-friendly CSV
         session_dir = os.path.dirname(state.session_path)
         pending_csv = os.path.join(session_dir, "pending_batch.csv")
-        rows = [{"trial_number": p["trial_number"], **p["params"]} for p in pending]
+        rows = [{"trial_number": p["trial_number"], **p["params"]} for p in param_dicts]
         pd.DataFrame(rows).to_csv(pending_csv, index=False)
 
     @staticmethod

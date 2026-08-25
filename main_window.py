@@ -52,7 +52,8 @@ from optuna_builder import (
     tell_batch,
 )
 from param_card_widget import ParamCardWidget
-from parameter_config import ObjectiveConfig, ParameterConfig, StudyConfig
+from constraint_dialog import ConstraintDialog
+from parameter_config import ObjectiveConfig, ParameterConfig, ParameterConstraint, StudyConfig
 from session_manager import SessionManager, SessionState
 from worker import OptimizationWorker
 
@@ -545,6 +546,8 @@ class MainWindow(QMainWindow):
         self._obj_row_widgets: List[tuple] = []
         # Per-column checkboxes in the objectives selector
         self._obj_col_rows: List[tuple] = []  # (col, QCheckBox, QComboBox)
+        # User-defined parameter constraints (equality / inequality rules)
+        self._constraints: List[ParameterConstraint] = []
 
         self._build_menu()
         self._build_toolbar()
@@ -945,6 +948,16 @@ class MainWindow(QMainWindow):
         apply_btn.clicked.connect(self._action_apply_objectives)
         self._obj_inner_layout.addWidget(apply_btn)
 
+        constraint_btn = QPushButton("📐  Constraints…")
+        constraint_btn.setToolTip(
+            "Define rules that constrain how parameter values relate to each other.\n"
+            "Examples:\n"
+            "  • CsPbI + FAPbI + MAPbI = 1  (compositional fractions)\n"
+            "  • temp * time ≤ 50000  (processing budget)"
+        )
+        constraint_btn.clicked.connect(self._action_open_constraints)
+        self._obj_inner_layout.addWidget(constraint_btn)
+
     # ══════════════════════════════════════════════════════════════════════
     # Apply objectives → build param cards + study
     # ══════════════════════════════════════════════════════════════════════
@@ -972,6 +985,7 @@ class MainWindow(QMainWindow):
         config = StudyConfig(
             parameters=params,
             objectives=objectives,
+            constraints=list(self._constraints),
             batch_size=self._batch_size_spin.value(),
             n_batches=self._n_batches_spin.value(),
             sampler_name=self._sampler_combo.currentText(),
@@ -989,6 +1003,9 @@ class MainWindow(QMainWindow):
             )
 
         self._session_state.study_config = config
+        # Persist the updated config (including constraints) immediately so it
+        # survives a restart even if the user never runs a batch.
+        SessionManager.save(self._session_state)
 
         # Build / reload the Optuna study
         self._study = build_study(
@@ -1010,6 +1027,39 @@ class MainWindow(QMainWindow):
         self._refresh_recent_menu()
         self._refresh_design_space()   # show historical data, no suggestions yet
         self._set_status(f"Ready — {added} historical trials loaded, {skipped} skipped.")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Constraint editor
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _action_open_constraints(self) -> None:
+        """Open the ConstraintDialog so the user can add / edit / remove rules."""
+        # Build the list of available parameter names from the current CSV
+        # (all non-objective columns).
+        param_names: List[str] = []
+        if self._df is not None and self._session_state is not None:
+            result_cols = {o.column_name for o in self._session_state.study_config.objectives}
+            param_names = [c for c in self._df.columns if c not in result_cols]
+        elif self._df is not None:
+            param_names = list(self._df.columns)
+
+        dlg = ConstraintDialog(
+            constraints=list(self._constraints),
+            param_names=param_names,
+            parent=self,
+        )
+        if dlg.exec() == QDialog.Accepted:
+            self._constraints = dlg.constraints
+            # Persist immediately so constraints survive a restart without needing
+            # the user to click "Apply Objectives" again.
+            if self._session_state:
+                self._session_state.study_config.constraints = list(self._constraints)
+                SessionManager.save(self._session_state)
+            n = len(self._constraints)
+            self._set_status(
+                f"{n} constraint(s) defined. "
+                "Click 'Apply Objectives' to rebuild the study with these constraints."
+            )
 
     # ══════════════════════════════════════════════════════════════════════
     # Parameter cards
@@ -1222,7 +1272,14 @@ class MainWindow(QMainWindow):
         trial_numbers = [r["trial_number"] for r in results]
         values_list   = [r["values"]        for r in results]
         self._append_results_to_csv(results)
-        tell_batch(self._study, trial_numbers, values_list)
+        # Pass constrained params so the surrogate trains on feasible values.
+        pending_by_num = {
+            p["trial_number"]: p["params"]
+            for p in (self._session_state.pending_batch or [])
+        }
+        constrained = [pending_by_num.get(n, {}) for n in trial_numbers]
+        tell_batch(self._study, trial_numbers, values_list,
+                   constrained, self._session_state.study_config)
         SessionManager.clear_pending_batch(self._session_state)
         self._resume_banner.hide()
         self._refresh_results_tables()
@@ -1270,7 +1327,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Study Load Error", str(exc))
             return
 
-        # Restore UI from config
+        # Restore UI from config (including constraints)
+        self._constraints = list(cfg.constraints)
         self._sampler_combo.setCurrentText(cfg.sampler_name)
         self._batch_size_spin.setValue(cfg.batch_size)
         self._n_batches_spin.setValue(cfg.n_batches)
@@ -1338,6 +1396,8 @@ class MainWindow(QMainWindow):
 
         if self._session_state:
             self._session_state.study_config = cfg
+        # Restore constraints to UI state so they are included in the next Apply
+        self._constraints = list(cfg.constraints)
         self._sampler_combo.setCurrentText(cfg.sampler_name)
         self._batch_size_spin.setValue(cfg.batch_size)
         self._n_batches_spin.setValue(cfg.n_batches)
@@ -1498,8 +1558,14 @@ class MainWindow(QMainWindow):
         values_list   = [r["values"]        for r in results]
         # Append actual compositions + results to the experiment CSV
         self._append_results_to_csv(results)
-        # Tell Optuna
-        tell_batch(self._study, trial_numbers, values_list)
+        # Pass constrained params so the surrogate trains on feasible values.
+        pending_by_num = {
+            p["trial_number"]: p["params"]
+            for p in (self._session_state.pending_batch or [])
+        }
+        constrained = [pending_by_num.get(n, {}) for n in trial_numbers]
+        tell_batch(self._study, trial_numbers, values_list,
+                   constrained, self._session_state.study_config)
         SessionManager.clear_pending_batch(self._session_state)
         self._resume_banner.hide()
         self._refresh_results_tables()

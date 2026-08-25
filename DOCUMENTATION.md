@@ -17,6 +17,7 @@
    - 3.7 [Entering Batch Results](#37-entering-batch-results)
    - 3.8 [Saving and Resuming Sessions](#38-saving-and-resuming-sessions)
    - 3.9 [Design Space Visualisation](#39-design-space-visualisation)
+   - 3.10 [Defining Parameter Constraints](#310-defining-parameter-constraints)
 4. [Headless / Scripting Mode](#4-headless--scripting-mode)
 5. [Codebase Architecture](#5-codebase-architecture)
    - 5.1 [File Map](#51-file-map)
@@ -41,6 +42,12 @@
 8. [Configuration Reference](#8-configuration-reference)
 9. [Common Adjustments & Recipes](#9-common-adjustments--recipes)
 10. [Troubleshooting](#10-troubleshooting)
+11. [Assumptions, Limitations & When to Trust the Results](#11-assumptions-limitations--when-to-trust-the-results)
+    - 11.1 [Data Assumptions](#111-data-assumptions)
+    - 11.2 [Optimizer Assumptions](#112-optimizer-assumptions)
+    - 11.3 [Validation Caveats](#113-validation-caveats)
+    - 11.4 [When to Use BHOP](#114-when-to-use-and-when-not-to-use-bhop)
+    - 11.5 [Reporting and Reproducibility](#115-reporting-and-reproducibility)
 
 ---
 
@@ -401,6 +408,94 @@ again after new batches are submitted will show the current state.
 
 ---
 
+### 3.10 Defining Parameter Constraints
+
+Parameter constraints let you express **algebraic rules** that the suggested
+experiments must satisfy. The most common use case is a **compositional
+constraint** — when your parameters are fractions that must sum to 1.
+
+#### Opening the dialog
+
+After loading a CSV, click **📐 Constraints…** in the Objectives panel (just
+below "Apply Objectives →"). The Constraint Editor dialog opens.
+
+#### Adding a constraint
+
+1. Click **+ Add** to create a new row.
+2. Type the **expression** (using Python arithmetic notation):
+   ```
+   CsPbI + FAPbI + MAPbI
+   ```
+3. Choose the **operator**: `=`, `<=`, or `>=`.
+4. Enter the **target value** (e.g. `1.0` for a unit-sum constraint).
+5. *(Equality only)* Optionally type a **residual parameter** name — the
+   parameter that will be computed automatically to satisfy the constraint
+   (so it is removed from the Optuna search space):
+   ```
+   Residual param: MAPbI
+   ```
+   This means BHOP will suggest CsPbI and FAPbI freely, then set
+   `MAPbI = 1 − CsPbI − FAPbI` automatically.
+6. Click **Validate** to check that the expression is well-formed and the
+   residual parameter exists in your CSV.
+7. Click **OK** to accept.
+
+> **Tip:** You only need a residual parameter for **equality** constraints.
+> For inequality constraints (`<=`, `>=`), leave the residual blank — BHOP
+> will project violated suggestions back onto the constraint boundary.
+
+#### Applying constraints to the study
+
+After defining constraints, click **Apply Objectives →** in the usual way.
+This rebuilds the Optuna study with the constraints active. Constraints are
+stored in the session JSON and restored automatically on reload.
+
+#### How equality constraints work (N−1 strategy, surrogate-correct)
+
+For an equality constraint `A + B + C = 1` with residual `C`:
+- Optuna's **search space is reduced**: only `A` and `B` are free variables.
+  `C` has no distribution and is never suggested by Optuna directly.
+- After `study.ask()`, `C` is computed as `1 − A − B`.  
+  If `A + B > 1` (residual would be negative), `A` and `B` are scaled
+  down proportionally so the sum stays at exactly 1 and `C ≥ 0`.
+- The **session JSON and BatchResultsDialog always show the fully
+  constrained values** — including the computed `C` — so the user sees
+  exactly what to prepare in the lab.
+- When results are submitted, the **raw Optuna trial is marked FAILED**
+  (removing its unconstrained internal params from the surrogate), and a
+  new COMPLETE trial is added using the constraint-satisfying values.
+  This means the surrogate always trains on feasible data and its
+  coordinate system matches the actual experiments — providing correct
+  Bayesian learning regardless of how far the raw suggestion was from the
+  feasible space.
+
+#### How inequality constraints work
+
+For an inequality `A * B <= 50000` (a budget constraint):
+- Optuna suggests `A` and `B` freely.
+- After suggestion, the constraint is evaluated. If violated, both `A` and `B`
+  are scaled uniformly to the boundary (`A * B = 50000`).
+- The TPE / NSGA-II sampler also receives a `constraints_func` so that
+  over time it learns to avoid infeasible regions.
+
+#### Expression syntax
+
+Expressions use standard Python arithmetic. Available operators:
+`+`, `-`, `*`, `/`, `**`, `(`, `)`.
+
+Parameter names must **exactly match** your CSV column names (case-sensitive).
+
+**Examples:**
+
+| Expression | Op | Target | Meaning |
+|---|---|---|---|
+| `CsPbI + FAPbI + MAPbI` | `=` | `1.0` | Fractions sum to 1 |
+| `temperature * time` | `<=` | `50000` | Processing budget cap |
+| `concentration` | `>=` | `0.05` | Minimum concentration |
+| `x1 + x2 + x3 + x4` | `=` | `1.0` | 4-component mixture |
+
+---
+
 ## 4. Headless / Scripting Mode
 
 `BHOP.py` is a self-contained example showing how to use the backend without
@@ -465,6 +560,7 @@ PythonProject1/
 ├── param_card_widget.py     UI: one card per parameter in the left dock
 ├── batch_results_dialog.py  UI: dialog for entering batch results
 ├── dead_region_dialog.py    UI: dialog for defining dead regions
+├── constraint_dialog.py     UI: dialog for defining algebraic parameter constraints
 │
 ├── BHOP.py                  Headless scripting example
 ├── test_backend.py          Pytest test suite
@@ -611,6 +707,25 @@ class ObjectiveConfig:
     direction: Literal["minimize", "maximize"] = "minimize"
 ```
 
+#### `ParameterConstraint`
+
+An algebraic rule that the suggested experiment must satisfy.
+
+```python
+@dataclass
+class ParameterConstraint:
+    expression:     str                     # e.g. "CsPbI + FAPbI + MAPbI"
+    operator:       Literal["=", "<=", ">="]
+    target:         float                   # e.g. 1.0
+    residual_param: Optional[str] = None    # equality only: param computed from others
+```
+
+Key methods:
+- **`is_satisfied(params) → (bool, float)`** — evaluates the expression with the
+  given params dict; returns `(satisfied, violation_magnitude)`.
+- **`eval_expr(expression, params) → float`** — static method; evaluates a
+  Python arithmetic expression with the given variable bindings.
+
 #### `StudyConfig`
 
 Top-level configuration for an entire optimisation session.
@@ -619,6 +734,7 @@ Top-level configuration for an entire optimisation session.
 |---|---|---|---|
 | `parameters` | `List[ParameterConfig]` | `[]` | All input parameters |
 | `objectives` | `List[ObjectiveConfig]` | `[]` | Result columns to optimise |
+| `constraints` | `List[ParameterConstraint]` | `[]` | Algebraic constraints on parameter values |
 | `batch_size` | `int` | `1` | Suggestions per round |
 | `n_batches` | `int` | `10` | Total rounds |
 | `sampler_name` | `str` | `"TPE"` | `"TPE"`, `"NSGAII"`, or `"Random"` |
@@ -930,6 +1046,24 @@ A `QDialog` for defining forbidden intervals on a numeric parameter.
 - Validates with `sampler_utils.validate_subranges()` before accepting.
 - For categorical parameters, shows a checklist to un-allow specific values.
 
+#### `constraint_dialog.py — ConstraintDialog`
+
+A `QDialog` for creating, editing, and removing algebraic parameter
+constraints. Opened via the **📐 Constraints…** button in the Objectives panel.
+
+Each constraint row contains:
+- **Expression** field — Python arithmetic expression over parameter names.
+- **Operator** combo — `=`, `<=`, `>=`.
+- **Target** spin box — numeric RHS value.
+- **Residual param** field — (equality only) the parameter computed from the others.
+- **Validate** button — checks syntax and that the residual name exists in the
+  parameter list.
+- **🗑 Remove** button — removes the row.
+
+Key methods:
+- **`get_constraints() → List[ParameterConstraint]`** — returns the validated
+  list of constraints when the dialog is accepted.
+
 ---
 
 ### 6.8 `main.py` & `BHOP.py`
@@ -988,7 +1122,7 @@ From the project root directory:
 
 ```bash
 # Windows (adjust path to your python.exe if needed)
-"C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\python.exe" validate_perovskite.py
+"C:\Users\simon\AppData\Local\Python\pythoncore-3.14-64\python.exe" validate_perovskite.py
 
 # macOS / Linux
 python validate_perovskite.py
@@ -1323,6 +1457,43 @@ EI_XI = 0.1    # more exploration (useful when the landscape is noisy)
 
 ---
 
+### Enforce a compositional constraint (fractions summing to 1)
+
+**In the GUI:**
+1. Load your CSV and select the objective column(s).
+2. Click **📐 Constraints…**.
+3. Click **+ Add**, then fill in:
+   - Expression: `CsPbI + FAPbI + MAPbI`
+   - Operator: `=`
+   - Target: `1.0`
+   - Residual param: `MAPbI`  ← BHOP will compute this automatically
+4. Click **Validate**, then **OK**.
+5. Click **Apply Objectives →** as usual.
+
+From this point, every batch suggestion will have `CsPbI + FAPbI + MAPbI = 1.0`
+guaranteed. The `MAPbI` column will appear in the `BatchResultsDialog` with its
+computed value already filled in.
+
+**Programmatically (headless mode):**
+```python
+from parameter_config import ParameterConstraint, StudyConfig
+
+config = StudyConfig(
+    parameters=[...],          # CsPbI, FAPbI defined; MAPbI included too
+    objectives=[...],
+    constraints=[
+        ParameterConstraint(
+            expression="CsPbI + FAPbI + MAPbI",
+            operator="=",
+            target=1.0,
+            residual_param="MAPbI",
+        )
+    ],
+)
+```
+
+---
+
 ### Run only a subset of validation sections
 
 Each section is a standalone function. You can call only what you need:
@@ -1422,6 +1593,203 @@ def make_gp():
         normalize_y=True, random_state=SEED,
     )
 ```
+
+---
+
+---
+
+## 11. Assumptions, Limitations & When to Trust the Results
+
+This section exists so you can make an **informed decision** about whether
+BHOP is appropriate for your experiment before committing real lab time to its
+suggestions.  Every tool has assumptions; understanding them protects you from
+misplaced confidence.
+
+---
+
+### 11.1 Data Assumptions
+
+#### Replicate averaging
+When two or more rows in your CSV have identical parameter values (replicates),
+BHOP averages them into a single training point before fitting the surrogate.
+
+- **Assumes**: measurement noise is independent and identically distributed
+  (i.i.d.) — i.e. each replicate is an unbiased noisy observation of the
+  same true underlying value.
+- **Breaks down when**: there is systematic batch-to-batch drift (e.g. equipment
+  calibration shifts between runs), or when replicates come from meaningfully
+  different conditions not captured in the CSV columns.
+- **What to check**: `§0 – Replicate analysis` in the validation script prints
+  the median coefficient of variation (CV).  A CV > 50 % is a warning sign.
+  If replicates from the same day agree well but across-day replicates vary
+  greatly, your system has drift — consider adding a time/batch column.
+
+#### Stationarity
+Both the Gaussian Process (GP) and the TPE surrogate assume the objective
+function is **stationary** — that the smoothness and correlation length are
+roughly the same everywhere in parameter space.
+
+- **Breaks down when**: the landscape has abrupt phase transitions, bimodal
+  distributions, or very different behaviour in different regions.
+- **What to look for**: residual plots (`s1_residuals_by_region.png`)
+  showing systematically higher errors in one part of parameter space.
+
+#### Column independence
+BHOP treats each enabled CSV column as an independent free variable.
+
+- **Breaks down when**: columns are physically coupled but not constrained
+  (e.g. temperature and pressure in a gas reaction).  Constraint expressions
+  help when the coupling is algebraic; if it is only physical, the surrogate
+  will explore physically impossible combinations.
+- **What to do**: use the **📐 Constraints…** dialog to add algebraic rules,
+  or disable one of the coupled columns and compute it from the other.
+
+#### No hidden variables
+The surrogate assumes the columns in your CSV capture all relevant
+experimental factors.
+
+- **Common hidden variables**: operator, ambient humidity, equipment age,
+  lot number of reagents, time-of-day.
+- **What this causes**: unexplained variance that looks like measurement noise
+  to the model, inflating RMSE and reducing prediction accuracy.
+- **Mitigation**: add categorical columns for controllable hidden variables
+  (e.g. `operator = "A"/"B"`, `batch = 1/2/3`).
+
+---
+
+### 11.2 Optimizer Assumptions
+
+#### TPE needs sufficient historical data
+The TPE sampler builds a probabilistic model (Parzen density estimators).
+Before it has seen roughly **5–10 trials per free parameter**, its model is
+no better than random — the first few batches are essentially exploration.
+
+> **Rule of thumb**: if you have fewer than `5 × N_parameters` historical
+> rows in your CSV, load them first (via "Apply Objectives") to seed the model
+> before asking for suggestions.  The app warns you if this ratio is not met.
+
+#### Batch parallelism reduces per-trial efficiency
+Standard sequential BO asks one experiment at a time, fits the surrogate,
+then asks again.  BHOP's batch mode asks `batch_size` experiments at once
+using Optuna's **constant liar** approximation (each trial assumes the pending
+results equal the current best).  This means:
+
+- Batch BO requires **more total experiments** to reach a given quality than
+  single-trial BO would.
+- The degradation is modest for `batch_size ≤ 5`; it increases for larger batches.
+- Use `batch_size = 1` if experiment throughput allows, to maximise learning rate.
+
+#### EI assumes Gaussian noise
+The Expected Improvement formula is optimal under Gaussian (symmetric,
+light-tailed) measurement noise.  If your measurements have a heavy tail or
+are skewed (common in degradation or lifetime data), EI will be overconfident.
+
+- **Symptom**: the model repeatedly suggests compositions in a narrow region
+  based on a few outlier observations.
+- **Mitigation**: log-transform the target column before loading if the
+  distribution is strongly right-skewed (e.g. lifetime data).
+
+#### Categorical parameters are unordered
+BHOP encodes categorical parameters using `CategoricalDistribution`.  Optuna
+does not know that `"low" < "medium" < "high"`.
+
+- **What to do**: for ordinal categories, replace them with a numeric column
+  (e.g. `0`, `1`, `2`) and set the type to `INT`.
+
+#### Equality constraint: residual coordinate system
+When an equality constraint is active (e.g. `A + B + C = 1`) with a residual
+parameter, the surrogate operates in the **N−1 dimensional** internal space
+of free parameters.  BHOP enforces the constraint by:
+
+1. Failing the raw Optuna suggestion (if it violates the constraint).
+2. Adding a corrected COMPLETE trial with the feasible values.
+
+The surrogate therefore always trains on constraint-satisfying data.
+However, the internal coordinate system is not the same as the physical
+fractions — the surrogate may sample unevenly across the feasible simplex,
+particularly in early iterations when the model is undetermined.  This is
+expected and resolves as more data accumulates.
+
+---
+
+### 11.3 Validation Caveats
+
+#### Virtual BO (§2) is optimistic
+The pool-based virtual BO test (`section2` in `validate_perovskite.py`)
+simulates the optimisation loop using **exact ground-truth values** from the
+dataset.  In a real campaign:
+
+- Each evaluation has measurement noise.
+- You may not be able to hit the exact suggested composition in the lab.
+- The pool is fixed (only compositions already in the dataset are candidates).
+
+This means **real-world BO will typically converge more slowly** than the
+virtual BO plots suggest.  The gap between BO and random is usually still
+present, just smaller.
+
+#### Good metrics on perovskite don't transfer
+The validation suite (`validate_perovskite.py`) proves that the surrogate
+machinery works correctly on the perovskite stability dataset.  It does
+**not** prove that it will work on your dataset.
+
+**Before trusting BHOP suggestions for a new material system:**
+1. Collect ≥ 30 historical data points covering your parameter space.
+2. Adapt `validate_perovskite.py` to your CSV (change `FEATURES`, `TARGET`,
+   and the domain-knowledge checks in `section4`).
+3. Run it and confirm that Pearson r > 0.5 on the hold-out.
+4. Only then use BHOP suggestions to guide new experiments.
+
+#### Surrogate r > 0.5 does not mean absolute predictions are accurate
+A Pearson r of 0.85 means the model ranks compositions well but does not
+mean its absolute predictions are numerically precise.  RMSE quantifies the
+typical absolute error — check it against the range of your target to assess
+practical accuracy.
+
+---
+
+### 11.4 When to Use (and When Not to Use) BHOP
+
+#### Good fit ✅
+| Situation | Why BHOP helps |
+|---|---|
+| 3–15 continuous parameters | Well within TPE's reliable range |
+| Experiments take hours to days | BO's sequential learning is worth the setup cost |
+| Historical data available (≥ 20 rows) | Seeds the surrogate for better early suggestions |
+| Noisy measurements with replicates | Averaging + GP WhiteKernel handles noise |
+| Multi-component mixtures (fractions) | Use equality constraints with a residual param |
+
+#### Use with caution ⚠
+| Situation | Recommendation |
+|---|---|
+| > 15 free parameters | Switch to NSGAII; consider dimensionality reduction first |
+| Very tight budget (< 20 experiments total) | BO may not outperform random; use Design of Experiments (DoE) instead |
+| Strongly non-stationary landscape | Add domain-specific features or split into sub-regions |
+| Many categorical parameters | TPE handles categories, but the space can be hard to explore |
+| Strong time/batch effects | Add a batch column or use a model that accounts for drift |
+
+#### Not recommended ❌
+| Situation | Why |
+|---|---|
+| Real-time feedback loops (< minutes per experiment) | BO setup overhead exceeds benefit; use bandit algorithms |
+| Combinatorial discrete spaces (e.g. molecular graph search) | Use graph neural networks + genetic algorithms |
+| Safety-critical systems | BHOP has no built-in safety constraints or failure modes; add guardrails manually |
+| Fewer than 5 total experiments planned | You have no budget for exploration; use expert knowledge directly |
+
+---
+
+### 11.5 Reporting and Reproducibility
+
+If you use BHOP in research, include the following in your methods section:
+
+- Optuna version (`pip show optuna`)
+- Sampler used (TPE / NSGAII / Random)
+- Number of historical seed trials
+- Batch size and number of batches
+- Any constraints applied (expression, operator, target, residual param)
+- The `surrogate_metrics.csv` from the validation script
+
+This allows others to assess the quality of your surrogate model and
+reproduce your optimisation trajectory.
 
 ---
 
