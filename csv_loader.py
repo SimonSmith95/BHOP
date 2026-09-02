@@ -13,9 +13,13 @@ from parameter_config import AllowedSubRange, ObjectiveConfig, ParameterConfig, 
 
 
 def load_csv(path: str) -> pd.DataFrame:
-    """Read a CSV file and return a cleaned DataFrame."""
+    """Read a CSV file and return a cleaned DataFrame.
+
+    Supports both ',' and ';' delimiters (auto-detected via csv.Sniffer).
+    Handles UTF-8 BOM produced by Excel / Windows tools.
+    """
     try:
-        df = pd.read_csv(path)
+        df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
     except Exception as exc:
         raise ValueError(f"Cannot read CSV file '{path}': {exc}") from exc
     df.columns = [str(c).strip() for c in df.columns]
@@ -91,8 +95,12 @@ def extract_param_defaults(
         non_null = series.dropna()
 
         if ptype in (ParameterType.INT, ParameterType.FLOAT):
-            full_min = float(non_null.min())
-            full_max = float(non_null.max())
+            # Guard against all-NaN columns (non_null is empty → min/max are NaN)
+            if len(non_null) == 0:
+                full_min, full_max = 0.0, 1.0
+            else:
+                full_min = float(non_null.min())
+                full_max = float(non_null.max())
             # Guard against zero-width ranges (single unique value)
             if full_min == full_max:
                 full_max = full_min + (1.0 if ptype == ParameterType.INT else 0.01)
@@ -153,7 +161,14 @@ def load_trials_from_csv(df: pd.DataFrame, config: StudyConfig) -> List[dict]:
         # Skip rows with any missing objective value
         if any(pd.isna(row.get(c)) for c in obj_cols):
             continue
-        params = {name: row[name] for name in param_names if name in row.index}
+        params = {
+            name: row[name]
+            for name in param_names
+            if name in row.index and not pd.isna(row[name])
+        }
+        # Skip rows where any enabled parameter is missing — Optuna cannot use them
+        if len(params) < len([n for n in param_names if n in row.index]):
+            continue
         values = [float(row[c]) for c in obj_cols]
         results.append({"params": params, "values": values})
 
